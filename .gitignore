@@ -1,0 +1,9 @@
+# Beads / agent-tooling files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/
+.agents/
+.claude/
+.codex/
+CLAUDE.md
