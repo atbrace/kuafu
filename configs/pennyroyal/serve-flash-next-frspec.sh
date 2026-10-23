@@ -251,11 +251,9 @@ fi
 
 launch_args=(serve \
   --model-path "$TARGET_MODEL" \
-  # kuafu sys-l5fzgs: presharded skips the online rowwise-FP8 re-quant at load
-  # (boot weight phase 240s -> ~40s); first boot dumps the checkpoint under
-  # CACHE_BASE (rw mount) because /models is mounted read-only.
-  --load-format presharded \
-  --model-loader-extra-config "{\"presharded_path\":\"$CACHE_BASE/presharded\",\"draft_presharded_path\":\"$CACHE_BASE/presharded-draft\",\"verify_on_load\":true}" \
+  # ModelOptModelLoader owns the NVFP4 load path and rejects PreshardedModelLoader
+  # configuration; retain safetensors until an upstream-supported cache interface exists.
+  --load-format safetensors \
   --served-model-name pennyroyal \
   --host 0.0.0.0 --port 8001 --tp "$TP_SIZE" \
   --dtype "$COMPUTE_DTYPE" --quantization modelopt_fp4 --kv-cache-dtype "$KV_DTYPE" \
