@@ -67,14 +67,17 @@ pennyroyal_version_banner
 # Pin the qualified map and tokenizer: a different ID mapping changes draft
 # proposals and must never silently reuse this representation's cache namespace.
 TOKEN_MAP="$SCRIPT_DIR/frspec/flash-next-64k.pt"
-# The approved adaptive MTP width policy (C1 picks W4/W8 = steps 3/7, C2+
-# stays W4) ships as ordinary --speculative-adaptive-config file: automatic,
-# no user toggle. The launch runs the table's maximum (steps 7, draft tokens 8
-# at topk 1) because a candidate wider than the launch width is refused, not
-# resized, under captured graphs; the W8 state alone needs the BS1 decode
-# bucket, which the default spec-decode capture list keeps. This is a runtime
-# asset, so it is read from the repository, never copied to a host directory.
-ADAPTIVE_CONFIG="$SCRIPT_DIR/adaptive-next.json"
+# The approved Next width policy ships as an ordinary --speculative-adaptive-config
+# file. PENNY_MTP_POLICY selects which policy that is — tiered (the default:
+# W8 = steps 7 at C1, W4 = steps 3 at every batch of two or more), adaptive (the
+# v3.0.2 policy, whose C1 candidates move under the existing hold and backoff)
+# or fixed-w4 (steps 3 everywhere) — and the same setting selects the launch
+# maximum that can carry it, because a candidate wider than the launch width is
+# refused, not resized, under captured graphs. The wider launch states keep the
+# BS1 decode bucket, which the default spec-decode capture list already keeps.
+# Everything is a runtime asset, so it is read from the repository, never
+# copied to a host directory.
+source "$SCRIPT_DIR/mtp-policy.sh"
 
 CONTEXT_LENGTH=262144  # kuafu: native ceiling, no YaRN extrapolation
 PAGE_SIZE=64
@@ -112,7 +115,6 @@ fi
   exit 1
 }
 [[ -f "$TOKEN_MAP" ]] || { echo "FR-Spec map missing: $TOKEN_MAP" >&2; exit 1; }
-[[ -f "$ADAPTIVE_CONFIG" ]] || { echo "Adaptive MTP policy missing: $ADAPTIVE_CONFIG" >&2; exit 1; }
 mkdir -p "$CACHE_BASE"/{huggingface,torch,torchinductor,triton,cuda,flashinfer,sglang/jit}
 if [[ "$NIXL" == on ]]; then
   mkdir -p "$NIXL_STORAGE_BASE"
@@ -161,12 +163,17 @@ pennyroyal_check_tp_devices "$TP_SIZE" "$SGLANG_MM_PREPROCESS_DEVICE"
 # NVMe preflight imports Torch, Triton, FlashInfer and SGLang. Activate their
 # durable cache locations before selecting the optional backend.
 source "$SCRIPT_DIR/ple-backend.sh"
-configure_max_total_tokens  # kuafu: float KV - size pool from mem-fraction
+# No KV-token preset: unset or blank MAX_TOTAL_TOKENS leaves the pool to the
+# sizing SGLang profiles from the free memory, within the static memory fraction
+# below. A deliberately exported cap stays opt-in and is still validated, and
+# the 824,384 tokens in the v2.3-v3.0.2 records were the cap those boots asked
+# for; an uncapped FR-Spec pool has not been measured.
+configure_max_total_tokens
 
 TARGET_OVERRIDES='{}'  # kuafu: no rope override at native 262k
 printf 'Pennyroyal profile: Flash-Next FR-Spec\n  runtime: %s\n  target: %s\n  token map: %s\n  cache root: %s\n  NIXL root: %s\n' \
   "$SGLANG_EXE" "$TARGET_MODEL" "$TOKEN_MAP" "$CACHE_BASE" "${NIXL_STORAGE_BASE:-none}"
-echo "Verifying the pinned FR-Spec map, tokenizer and adaptive MTP policy..."
+echo "Verifying the pinned FR-Spec map and tokenizer..."
 read -r TOKEN_MAP_SHA _ < <(sha256sum "$TOKEN_MAP")
 [[ "$TOKEN_MAP_SHA" == becfa41d394b86c26c632bea8f3c6ea64bbb76d7b238d8673c06afae21269f25 ]] || {
   echo "FR-Spec map does not match the bundled checksum" >&2; exit 1;
@@ -174,10 +181,6 @@ read -r TOKEN_MAP_SHA _ < <(sha256sum "$TOKEN_MAP")
 read -r TOKENIZER_SHA _ < <(sha256sum "$TARGET_MODEL/tokenizer.json")
 [[ "$TOKENIZER_SHA" == 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3 ]] || {
   echo "Target tokenizer differs from the qualified FR-Spec tokenizer" >&2; exit 1;
-}
-read -r ADAPTIVE_SHA _ < <(sha256sum "$ADAPTIVE_CONFIG")
-[[ "$ADAPTIVE_SHA" == 64070286310a0d3eeeb3ff3ae074d1ca0fed2937d2274a0adfcb8ace84bc01ee ]] || {
-  echo "Adaptive MTP policy does not match the approved checksum" >&2; exit 1;
 }
 SGLANG_REV="$(git -C "$REPO_ROOT" rev-parse --short=10 HEAD)"
 PENNY_IDENTITY_PROBE="$("$PYTHON" -c 'import sys; import torch; from sglang.srt.utils import resolve_mm_preprocess_device; resolve_mm_preprocess_device(); from sglang.kernels.ops.gemm.sm120_online_fp8 import launch_precision; print(torch.__version__); print(launch_precision(sys.argv[1]))' "$TARGET_MODEL")"
@@ -214,9 +217,9 @@ else
       --field "compute_dtype=$COMPUTE_DTYPE" \
       --field "target_kv_dtype=$KV_DTYPE" \
       --field "speculative_algorithm=NEXTN" \
-      --field "speculative_num_steps=7" \
+      --field "speculative_num_steps=$PENNY_MTP_SPEC_STEPS" \
       --field "speculative_eagle_topk=1" \
-      --field "speculative_num_draft_tokens=8" \
+      --field "speculative_num_draft_tokens=$PENNY_MTP_DRAFT_TOKENS" \
       --field "speculative_adaptive=true" \
       --field "speculative_adaptive_policy_sha256=$ADAPTIVE_SHA" \
       --field "speculative_draft_quantization=unquant" \
@@ -251,13 +254,11 @@ fi
 
 launch_args=(serve \
   --model-path "$TARGET_MODEL" \
-  # ModelOptModelLoader owns the NVFP4 load path and rejects PreshardedModelLoader
-  # configuration; retain safetensors until an upstream-supported cache interface exists.
   --load-format safetensors \
   --served-model-name pennyroyal \
   --host 0.0.0.0 --port 8001 --tp "$TP_SIZE" \
   --dtype "$COMPUTE_DTYPE" --quantization modelopt_fp4 --kv-cache-dtype "$KV_DTYPE" \
-  --mem-fraction-static 0.981 \
+  --mem-fraction-static 0.97 \
   "${TOKEN_CAP_ARGS[@]}" --warmups=structured_output \
   --context-length "$CONTEXT_LENGTH" \
   --page-size "$PAGE_SIZE" --max-running-requests "$MAX_RUNNING_REQUESTS" --sleep-on-idle \
@@ -274,8 +275,8 @@ launch_args=(serve \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --enable-request-time-stats-logging --enable-metrics \
   --default-chat-template-kwargs "$DEFAULT_CHAT_TEMPLATE_KWARGS" \
-  --speculative-algorithm NEXTN --speculative-num-steps 7 \
-  --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 \
+  --speculative-algorithm NEXTN --speculative-num-steps "$PENNY_MTP_SPEC_STEPS" \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens "$PENNY_MTP_DRAFT_TOKENS" \
   --speculative-adaptive --speculative-adaptive-config "$ADAPTIVE_CONFIG" \
   --speculative-draft-model-quantization unquant \
   --speculative-token-map "$TOKEN_MAP" --watchdog-timeout 1800)
